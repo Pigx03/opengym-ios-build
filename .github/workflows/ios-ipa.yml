@@ -1,0 +1,109 @@
+name: Build openGym unsigned IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Upstream tag or commit to build'
+        required: true
+        default: '464355ef43d4c8f8a4e0bb6db9c2af7f240593b5'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  ipa:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - name: Check out public upstream source
+        uses: actions/checkout@v4
+        with:
+          repository: DuarteSantos8/openGym
+          ref: ${{ inputs.source_ref }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Record toolchain and source
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD
+          xcodebuild -version
+          node --version
+          pod --version
+
+      - name: Build standalone mobile resources and sync iOS
+        working-directory: frontend
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts --no-audit --no-fund
+          VITE_MOBILE=1 npm run build
+          node ../scripts/catalogue/stage-media.mjs dist
+          npx --no-install cap sync ios
+          node --input-type=module <<'JS'
+          import { checkCopy } from './scripts/check-mobile-bundle.mjs';
+          const problems = ['dist', 'ios/App/App/public'].flatMap(checkCopy);
+          if (problems.length) throw new Error(problems.join('\n'));
+          console.log('Mobile bundle verified in dist and iOS project');
+          JS
+
+      - name: Archive for physical iPhone without signing
+        run: |
+          set -euo pipefail
+          mkdir -p build-output
+          VERSION="$(node -p "require('./frontend/package.json').version")"
+          xcodebuild \
+            -workspace frontend/ios/App/App.xcworkspace \
+            -scheme App \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$PWD/build-output/App.xcarchive" \
+            MARKETING_VERSION="$VERSION" \
+            CURRENT_PROJECT_VERSION="${GITHUB_RUN_NUMBER}" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY='' \
+            archive 2>&1 | tee build-output/xcodebuild.log
+
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "require('./frontend/package.json').version")"
+          APP='build-output/App.xcarchive/Products/Applications/App.app'
+          test -f "$APP/Info.plist"
+          test -f "$APP/App"
+          test -f "$APP/public/index.html"
+          mkdir -p build-output/package/Payload
+          ditto "$APP" build-output/package/Payload/App.app
+          cd build-output/package
+          zip -qry "../openGym-${VERSION}-unsigned.ipa" Payload
+          cd ..
+          shasum -a 256 "openGym-${VERSION}-unsigned.ipa" > "openGym-${VERSION}-unsigned.ipa.sha256"
+          git -C "$GITHUB_WORKSPACE" rev-parse HEAD > source-commit.txt
+          echo 'Unsigned IPA built. Sign it before installation.' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save IPA download
+        uses: actions/upload-artifact@v4
+        with:
+          name: openGym-unsigned-IPA
+          path: |
+            build-output/*.ipa
+            build-output/*.sha256
+            build-output/source-commit.txt
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Save build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-build-diagnostics
+          path: build-output/xcodebuild.log
+          if-no-files-found: ignore
+          retention-days: 7
